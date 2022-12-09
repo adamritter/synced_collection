@@ -1,17 +1,16 @@
 use std::{cell::RefCell, rc::Rc};
 
-pub struct MessageListeners<'a, M> {
-    listeners: RefCell<Vec<Option<Box<dyn FnMut(M) + 'a>>>>
+pub struct MessageListeners<'listener, M> {
+    listeners: RefCell<Vec<Option<Box<dyn FnMut(M) + 'listener>>>>
 }
 
-
-impl<'a, M:Clone+'static> MessageListeners<'a, M> {
+impl<'listener, M:Clone+'static> MessageListeners<'listener, M> {
     pub fn new()->Self {
         MessageListeners { listeners: RefCell::new(Vec::new()) }
     }
 
     /// This method takes a function object and adds it to the vector of listeners.
-    pub fn listen(&self, f: impl FnMut(M)+'a)->usize {
+    pub fn listen(&self, f: impl FnMut(M)+'listener)->usize {
         self.listeners.borrow_mut().push(Some(Box::new(f)));
         self.listeners.borrow().len()-1
     }
@@ -31,19 +30,19 @@ impl<'a, M:Clone+'static> MessageListeners<'a, M> {
 }
 
 
-pub trait MessageListenersInterface<'a, M:Clone+'static> : Sized {
-    fn listeners(&self)->&MessageListeners<'a, M>;
-    fn listen(&self, f: impl FnMut(M)+'a) {
+pub trait MessageListenersInterface<'listener, M:Clone+'static> : Sized {
+    fn listeners(&self)->&MessageListeners<'listener, M>;
+    fn listen(&self, f: impl FnMut(M)+'listener) {
         println!("MessageListenersInterface::listen");
         MessageListeners::listen(self.listeners(), f);
     }
-     fn map<M2:Clone+'static>(&self, f: impl Fn(M)->M2 + 'a)->Rc<MessageListeners<'a, M2>> {
+     fn map<M2:Clone+'static>(&self, f: impl Fn(M)->M2 + 'listener)->Rc<MessageListeners<'listener, M2>> {
         let r = Rc::new(MessageListeners::new());
         let rclone=r.clone();
         self.listen(move |m|  rclone.send(f(m)));
         r
     }
-    fn filter(&self, f: impl Fn(&M)->bool + 'a)->Rc<MessageListeners<'a, M>> {
+    fn filter(&self, f: impl Fn(&M)->bool + 'listener)->Rc<MessageListeners<'listener, M>> {
         let r = Rc::new(MessageListeners::new());
         let rclone=r.clone();
         self.listeners().listen(move |m| if f(&m) { rclone.send(m)});
@@ -51,8 +50,8 @@ pub trait MessageListenersInterface<'a, M:Clone+'static> : Sized {
     }
 }
 
-impl<'a, M:Clone+'static> MessageListenersInterface<'a, M> for MessageListeners<'a, M> {
-    fn listeners(&self)->&MessageListeners<'a, M> {
+impl<'listener, M:Clone+'static> MessageListenersInterface<'listener, M> for MessageListeners<'listener, M> {
+    fn listeners(&self)->&MessageListeners<'listener, M> {
         self
     }
 }

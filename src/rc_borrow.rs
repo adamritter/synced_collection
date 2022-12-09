@@ -1,19 +1,15 @@
 use std::rc::Rc;
 use std::ops::Deref;
 
-pub struct Borrow<T>(*const T);
-
-impl<T> Deref for Borrow<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        unsafe { &*self.0 }
-    }
-}
-
+/// RcBorrow is a run-time life-time checker.
+/// 
+/// It's a wrapper around a reference that can live longer than the reference, but panics
+/// if the wrapper still has a living reference when the wrapper is dropped.
 pub struct RcBorrow<'a, T> {
     rc: Rc<Borrow<T>>,
     _t: &'a T
 }
+
 impl<'a, T> RcBorrow<'a, T> {
     pub fn new(t: &'a T) -> Self {
         Self {_t: t, rc: Rc::new(Borrow(t as *const T))}
@@ -35,6 +31,15 @@ impl<'a, T> Drop for RcBorrow<'a, T> {
         if Rc::strong_count(&self.rc) != 1 {
             panic!("someone still has the Rc, need to abort to avoid memory unsafety");
         }
+    }
+}
+
+pub struct Borrow<T>(*const T);
+
+impl<T> Deref for Borrow<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.0 }
     }
 }
 
@@ -63,10 +68,10 @@ fn test_rc_borrow_deref() {
 #[should_panic]
 fn test_rc_borrow_panic() {
     let x: u32 = 123;
-    let mut evil: Option<Rc<Borrow<u32>>> = None;
+    let mut _evil: Option<Rc<Borrow<u32>>> = None;
     {
         let rcb = RcBorrow::new(&x);
         assert_eq!(**rcb.get(), 123);
-        evil = Some(rcb.get());
+        _evil = Some(rcb.get());
     }
 }
