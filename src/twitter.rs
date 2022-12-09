@@ -26,7 +26,7 @@ impl WebSocketByClient {
     pub fn new()->Self {
         Self {}
     }
-    pub fn client_collection<M: Debug+Clone+'static>(&self, ml: &impl MessageListenersInterface<M>) {
+    pub fn client_collection<'a, M: Debug+Clone+'static>(&self, ml: &impl MessageListenersInterface<'a, M>) {
         ml.listen(|m| {
             println!("client_collection: {:?}", m);
         });
@@ -50,7 +50,7 @@ trait MessageListenersInterfaceAdd<M> {
     fn add_to_web_socket_by_client(&self, w: &WebSocketByClient);
 }
 
-impl<M: Debug+Clone+'static, I: MessageListenersInterface<M>>  MessageListenersInterfaceAdd<M>  for I {
+impl<'a, M: Debug+Clone+'static, I: MessageListenersInterface<'a, M>>  MessageListenersInterfaceAdd<M>  for I {
     fn add_to_web_socket_by_client(&self, w: &WebSocketByClient) {
         w.client_collection(self);
     }
@@ -103,13 +103,13 @@ pub fn test_twitter() {
             tweets.insert(user_id, (Utc::now().naive_utc(), s));
         }
     };
-    renderer(&mut ws, &seen_by_client, followed_by_client, follow, set_uuid, create_tweet);
+    renderer(&mut ws, &*seen_by_client, &*followed_by_client, follow, set_uuid, create_tweet);
 }
 
 
-fn renderer(ws: &mut WebSocketByClient,
-    seen_tweets: &impl MessageListenersInterface<MultiSetModifyMessage<(ClientId, (Uuid, Uuid, NaiveDateTime, String))>>,
-    followed_by_client: impl MessageListenersInterface<MultiSetModifyMessage<(ClientId, Uuid)>>,
+fn renderer<'listener>(ws: &mut WebSocketByClient,
+    seen_tweets: &impl MessageListenersInterface<'listener, MultiSetModifyMessage<(ClientId, (Uuid, Uuid, NaiveDateTime, String))>>,
+    followed_by_client: &impl MessageListenersInterface<'listener, MultiSetModifyMessage<(ClientId, Uuid)>>,
     mut follow: impl FnMut(ClientId, Uuid),
     mut set_uuid: impl FnMut(ClientId, Uuid),
     mut create_tweet: impl FnMut(ClientId, String)) {

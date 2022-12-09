@@ -9,7 +9,7 @@ impl<M:Clone+'static> MessageListeners2<M> {
     pub fn new()->Self {
         MessageListeners2 { listeners: RefCell::new(Vec::new()) }
     }
-    pub fn listen(&self, f: impl FnMut(M)) {
+    pub fn listen<'a>(&self, f: impl FnMut(M)) {
         self.listeners.borrow_mut().push(Box::new(f));
     }
     pub fn send(&self, message: M) {

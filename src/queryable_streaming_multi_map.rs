@@ -1,10 +1,9 @@
 use std::{collections::{HashSet, HashMap}, cell::RefCell, rc::{Rc, Weak}, marker::PhantomData};
 
-use crate::{multi_set::{MultiSetModifyMessage, MultiSetMessageListeners}, message_listeners::{MessageListenersInterface, MessageListeners}, rc_borrow::RcBorrow};
+use crate::{multi_set::{MultiSetModifyMessage, MultiSetMessageListeners}, message_listeners::{MessageListenersInterface, MessageListeners}, rc_borrow::{RcBorrow, Borrow}};
 use std::hash::Hash;
 
-pub trait QuerableStreamingMultiMapReciever<'a, K:Eq+Hash+Clone + 'static,V:Eq+Hash+Clone+'static> :
-     MessageListenersInterface<'a, MultiSetModifyMessage<(K,V)>>  {
+pub trait QuerableStreamingMultiMapGetter<K:Eq+Hash+Clone + 'static,V:Eq+Hash+Clone+'static> {
     fn get(&self, key: &K)->HashSet<V>;
     fn get_one(&self, key: &K)->Option<V> {
         let set=self.get(key);
@@ -22,23 +21,22 @@ pub trait QuerableStreamingMultiMapReciever<'a, K:Eq+Hash+Clone + 'static,V:Eq+H
 ///
 ///  Requesting set of all values for a key is efficient, which makes joining
 ///   multiple QuerableStreamingMultiMaps on the same key efficient.
-pub trait QuerableStreamingMultiMap<'a, K:Eq+Hash+Clone + 'static,V:Eq+Hash+Clone+'static> :
-     MessageListenersInterface<'a, MultiSetModifyMessage<(K,V)>>  {
-    fn get(&self, key: &K)->HashSet<V>;
-    fn get_one(&self, key: &K)->Option<V> {
-        let set=self.get(key);
-        if set.len()!=1 {
-            None
-        } else {
-            Some(set.iter().next().unwrap().clone())
-        }
+pub trait QuerableStreamingMultiMap<'source, 'listener, K:Eq+Hash+Clone + 'static,V:Eq+Hash+Clone+'static> :
+     MessageListenersInterface<'listener, MultiSetModifyMessage<(K,V)>>  {
+    type Getter : QuerableStreamingMultiMapGetter<K,V> + 'source + 'listener;
+    fn getter(&self)->&Self::Getter;
+    fn get(&self, key: &K)->HashSet<V> {
+        self.getter().get(key)
     }
-    fn filter_item<'b, Allow: Fn(K,V)->bool>(&'b self, allow: Allow)->
-            FilterQuerableStreamingMultiMap<'a, 'b, K, V, Self, Allow> {
+    fn get_one(&self, key: &K)->Option<V> {
+        self.getter().get_one(key)
+    }
+    fn filter_item<'last_source, Allow: Fn(K,V)->bool>(&'last_source self, allow: Allow)->
+            FilterQuerableStreamingMultiMap<'source, 'listener, 'last_source, K, V, Self, Allow> {
         FilterQuerableStreamingMultiMap::new(self, allow)
     }
-    fn filter_item_old<Allow: Fn(K,V)->bool+'a>(&'a self, allow: Allow)->
-        Rc<MessageListeners<'a, MultiSetModifyMessage<(K,V)>>> {
+    fn filter_item_old<Allow: Fn(K,V)->bool+'listener>(&'listener self, allow: Allow)->
+        Rc<MessageListeners<'listener, MultiSetModifyMessage<(K,V)>>> {
         let f = move |m: &MultiSetModifyMessage<(K,V)>| {
             match m {
                 MultiSetModifyMessage::InsertOne((k,v)) => allow(k.clone(), v.clone()),
@@ -47,15 +45,22 @@ pub trait QuerableStreamingMultiMap<'a, K:Eq+Hash+Clone + 'static,V:Eq+Hash+Clon
         };
         self.filter(f)
     }
-    fn map<T2:Clone+'static>(&'a self, f: impl Fn(K, V)->T2+'a)->Rc<MultiSetMessageListeners<'a, T2>> {
+    fn map<T2:Clone+'static>(&'source self, f: impl Fn(K, V)->T2+'listener)->
+            Rc<MultiSetMessageListeners<'listener, T2>> {
         self.listeners().map_items(move |(k, v)| f(k, v))
     }
+    fn join<'last_source,V2:Eq+Hash+Clone+'static, Source2: QuerableStreamingMultiMap<'source, 'listener, K, V2>>(
+            &'last_source self, other: &'last_source Source2)->
+            JoinQuerableStreamingMultiMap<'source, 'listener, 'last_source, K, V, V2, Self, Source2> {
+        JoinQuerableStreamingMultiMap::new(self, other)
+    }
     
-    fn reversed(&'a self)->Rc<StreamingHashMultiMapWithCount<V, K>> {
+    fn reversed<'last_source>(&'last_source self)->Rc<StreamingHashMultiMapWithCount<'listener, V, K>> {
         self.listeners().reversed()
     }
-    fn group_by<K2: Eq+Hash+Clone+'static, V2: Eq+Hash+Clone+'static>(
-            &'a self, f:impl Fn(K, V)->(K2, V2) + 'a)->Rc<StreamingHashMultiMapWithCount<K2,V2>> {
+    fn group_by<'last_source, K2: Eq+Hash+Clone+'static, V2: Eq+Hash+Clone+'static>(
+            &'last_source self, f:impl Fn(K, V)->(K2, V2) + 'listener) ->
+            Rc<StreamingHashMultiMapWithCount<'listener, K2,V2>> {
         self.listeners().group_by(f)
     }
 }
@@ -76,8 +81,8 @@ pub trait QuerableStreamingMultiMap<'a, K:Eq+Hash+Clone + 'static,V:Eq+Hash+Clon
 /// 
 /// It also provides an interface that shows those pairs only once, thereby
 /// it's a useful datastructure for joining multiple data sets on the same key.
-pub struct StreamingHashMultiMapWithCount<'a, K: Eq+Hash+Clone+'static, V: Eq+Hash+Clone+'static> {
-    listeners: MultiSetMessageListeners<'a, (K, V)>,
+pub struct StreamingHashMultiMapWithCount<'listener, K: Eq+Hash+Clone+'static, V: Eq+Hash+Clone+'static> {
+    listeners: MultiSetMessageListeners<'listener, (K, V)>,
     data: RefCell<HashMap<K, HashMap<V, u64>>>
 }
 
@@ -87,8 +92,30 @@ impl<'a, K: Eq+Hash+Clone+'static, V: Eq+Hash+Clone+'static> StreamingHashMultiM
     }
 }
 
-impl<'a, K: Eq+Hash+Clone + 'static, V: Eq+Hash+Clone+'static>
-     QuerableStreamingMultiMap<'a, K,V> for StreamingHashMultiMapWithCount<'a, K, V> {
+impl<K: Eq+Hash+Clone + 'static, V: Eq+Hash+Clone+'static> 
+    QuerableStreamingMultiMapGetter<K,V> for RefCell<HashMap<K, HashMap<V, u64>>> {
+    fn get(&self, key: &K)->HashSet<V> {
+        let data = self.borrow();
+        let values=data.get(key);
+        if values.is_none() {
+            return HashSet::new();
+        } else {
+            let mut r=HashSet::new();
+            for key in values.unwrap().keys() {
+                r.insert(key.clone());
+            }
+            return r;
+        }
+    }
+}
+
+impl<'listener, K: Eq+Hash+Clone + 'static, V: Eq+Hash+Clone+'static>
+     QuerableStreamingMultiMap<'_, 'listener, K,V>
+     for StreamingHashMultiMapWithCount<'listener, K, V> {
+    type Getter = RefCell<HashMap<K, HashMap<V, u64>>>;
+    fn getter(&self)->&Self::Getter {
+        &self.data
+    }
     fn get(&self, key: &K)->HashSet<V> {
         let data = self.data.borrow();
         let values=data.get(key);
@@ -175,21 +202,54 @@ impl<'a, K: Eq+Hash+Clone+'static, V: Eq+Hash+Clone+'static> StreamingHashMultiM
     }
 }
  
-pub struct FilterQuerableStreamingMultiMap<'a, 'b, K:Eq+Hash+Clone+'static,V:Eq+Hash+Clone+'static,
-    Source: QuerableStreamingMultiMap<'a, K,V>, Allow: Fn(K, V)->bool + 'a> {
-    source: &'b Source,
-    listeners:  Rc<MultiSetMessageListeners<'a, (K, V)>>,
-    allow: Rc<Allow>
+pub struct FilterQuerableStreamingMultiMap<'source, 'listener, 'last_source, K:Eq+Hash+Clone+'static,V:Eq+Hash+Clone+'static,
+    Source: QuerableStreamingMultiMap<'source, 'listener, K,V>,
+    Allow: Fn(K, V)->bool + 'source + 'listener> {
+    source: &'last_source Source,
+    listeners:  Rc<MultiSetMessageListeners<'listener, (K, V)>>,
+    allow: Rc<Allow>,
+    getter: FilterQuerableStreamingMultiMapGetter<K,V, Source::Getter, Allow>,
+    source_getter: RcBorrow<'last_source, Source::Getter>
 }
 
-impl<'a, 'b, 'c : 'a, K:Eq+Hash+Clone,V:Eq+Hash+Clone, Source: QuerableStreamingMultiMap<'a, K,V>,
-        Allow: Fn(K, V)->bool + 'c>
-    FilterQuerableStreamingMultiMap<'a, 'b, K,V, Source, Allow> {
-    pub fn new(source: &'b Source, allow: Allow)->Self {
+pub struct FilterQuerableStreamingMultiMapGetter<K:Eq+Hash+Clone+'static,V:Eq+Hash+Clone+'static,
+        SourceGetter: QuerableStreamingMultiMapGetter<K,V>,
+        Allow: Fn(K, V)->bool> {
+    source: Rc<Borrow<SourceGetter>>,
+    allow: Rc<Allow>,
+    phantom_data: PhantomData<(K,V)>
+}
+
+impl <'source, 'listener, K:Eq+Hash+Clone,V:Eq+Hash+Clone,
+        Getter: QuerableStreamingMultiMapGetter<K,V>,
+        Allow: Fn(K, V)->bool + 'source + 'listener>
+    QuerableStreamingMultiMapGetter<K,V>
+            for FilterQuerableStreamingMultiMapGetter<K,V, Getter, Allow> {
+        fn get(&self, key: &K)->HashSet<V> {
+        let values=self.source.get(key);
+        let allow=&self.allow;
+        values.into_iter().filter(|v| allow(key.clone(), v.clone())).collect()
+    }
+}
+
+impl<'source, 'listener, 'last_source, K:Eq+Hash+Clone,V:Eq+Hash+Clone,
+        Source: QuerableStreamingMultiMap<'source, 'listener, K,V>,
+        Allow: Fn(K, V)->bool + 'source + 'listener>
+    FilterQuerableStreamingMultiMap<'source, 'listener, 'last_source, K,V, Source, Allow> {
+    pub fn new(source: &'last_source Source, allow: Allow)->Self {
+        let source_getter=RcBorrow::new(source.getter());
+        let allow=Rc::new(allow);
         let r = Self {
-            allow: Rc::new(allow),
+            allow: allow.clone(),
             listeners: Rc::new(MultiSetMessageListeners::new()),
-            source};
+            source,
+            getter: FilterQuerableStreamingMultiMapGetter {
+                source: source_getter.get(),
+                allow,
+                phantom_data: PhantomData
+            },
+            source_getter
+        };
             
         let lclone=r.listeners.clone();
         let aclone=r.allow.clone();
@@ -218,10 +278,15 @@ impl<'a, 'b, 'c : 'a, K:Eq+Hash+Clone,V:Eq+Hash+Clone, Source: QuerableStreaming
 //      FilterQuerableStreamingMultiMap<'a, 'b, K,V, Source, Allow> {
 //      }
 
-impl<'a, 'b, 'c, K:Eq+Hash+Clone,V:Eq+Hash+Clone, Source: QuerableStreamingMultiMap<'a, K,V>,
-        Allow: Fn(K, V)->bool + 'a>
-    QuerableStreamingMultiMap<'a, K,V> for
-     FilterQuerableStreamingMultiMap<'a, 'b, K,V, Source, Allow> {
+impl<'source, 'listener, 'last_source, K:Eq+Hash+Clone,V:Eq+Hash+Clone,
+        Source: QuerableStreamingMultiMap<'source, 'listener, K,V>,
+        Allow: Fn(K, V)->bool + 'source + 'listener>
+    QuerableStreamingMultiMap<'source, 'listener, K,V> for
+     FilterQuerableStreamingMultiMap<'source, 'listener, 'last_source, K,V, Source, Allow> {
+        type Getter=FilterQuerableStreamingMultiMapGetter<K,V, Source::Getter, Allow>;
+        fn getter(&self)->&Self::Getter {
+            &self.getter
+        }
         fn get(&self, key: &K)->HashSet<V> {
             let source_values=self.source.get(key);
             let mut r=HashSet::new();
@@ -234,11 +299,12 @@ impl<'a, 'b, 'c, K:Eq+Hash+Clone,V:Eq+Hash+Clone, Source: QuerableStreamingMulti
         }
 }
 
-impl <'a, 'b, 'c, K:Eq+Hash+Clone,V:Eq+Hash+Clone, Source: QuerableStreamingMultiMap<'a, K,V>,
-        Allow: Fn(K, V)->bool + 'a>
-    MessageListenersInterface<'a, MultiSetModifyMessage<(K,V)>> for
-     FilterQuerableStreamingMultiMap<'a, 'b, K,V, Source, Allow> {
-        fn listeners(&self)->&crate::message_listeners::MessageListeners<'a, MultiSetModifyMessage<(K,V)>> {
+impl <'source, 'listener, 'last_source, K:Eq+Hash+Clone,V:Eq+Hash+Clone,
+        Source: QuerableStreamingMultiMap<'source, 'listener, K,V>,
+        Allow: Fn(K, V)->bool + 'source + 'listener>
+    MessageListenersInterface<'listener, MultiSetModifyMessage<(K,V)>> for
+     FilterQuerableStreamingMultiMap<'source, 'listener, 'last_source, K,V, Source, Allow> {
+        fn listeners(&self)->&MessageListeners<'listener, MultiSetModifyMessage<(K,V)>> {
             &self.listeners
         }
 }
@@ -247,24 +313,38 @@ impl <'a, 'b, 'c, K:Eq+Hash+Clone,V:Eq+Hash+Clone, Source: QuerableStreamingMult
 // Order of construction / deconstruction:
 // listener should return an Rc<RefMut<Option<Box<&dyn FnMut>>>>???
 
-pub struct JoinQuerableStreamingMultiMap<'a, 'b, 'c, 'd, 'e, K:Eq+Hash+Clone+'static,V:Eq+Hash+Clone+'static, V2:Eq+Hash+Clone+'static,
-    Source: QuerableStreamingMultiMap<'c, K,V>, Source2: QuerableStreamingMultiMap<'e, K,V2>> {
-    source: RcBorrow<'a, Source>,
-    source2: RcBorrow<'b, Source2>,
-    listeners:  Rc<MultiSetMessageListeners<'d, (K, (V, V2))>>,
+pub struct JoinQuerableStreamingMultiMap<'source, 'listener, 'last_source, K:Eq+Hash+Clone+'static,V:Eq+Hash+Clone+'static, V2:Eq+Hash+Clone+'static,
+    Source: QuerableStreamingMultiMap<'source, 'listener, K,V>,
+    Source2: QuerableStreamingMultiMap<'source, 'listener, K,V2>> {
+    source: RcBorrow<'last_source, Source>,
+    source2: RcBorrow<'last_source, Source2>,
+    listeners:  Rc<MultiSetMessageListeners<'listener, (K, (V, V2))>>,
     source_cancel_index: Option<usize>,
     source2_cancel_index: Option<usize>,
-    phantom_data: PhantomData<&'c ()>,
-    phantom_data2: PhantomData<&'e ()>,
+    getter: JoinQuerableStreamingMultiMapGetter<K,V,V2, Source::Getter, Source2::Getter>,
+    source_getter: RcBorrow<'last_source, Source::Getter>,
+    source2_getter: RcBorrow<'last_source, Source2::Getter>,
 }
 
-impl<'a, 'b, 'c, 'd: 'c+'e, 'e, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clone,
-    Source: QuerableStreamingMultiMap<'c, K,V>, Source2: QuerableStreamingMultiMap<'e, K,V2>>
-    QuerableStreamingMultiMap<'d, K,(V, V2)> 
-    for JoinQuerableStreamingMultiMap<'a, 'b, 'c, 'd, 'e, K,V, V2, Source, Source2> {
+
+pub struct JoinQuerableStreamingMultiMapGetter<K:Eq+Hash+Clone+'static
+    ,V:Eq+Hash+Clone+'static, V2:Eq+Hash+Clone+'static,
+    SourceGetter: QuerableStreamingMultiMapGetter<K,V>,
+    SourceGetter2: QuerableStreamingMultiMapGetter<K,V2>> {
+    source: Rc<Borrow<SourceGetter>>,
+    source2: Rc<Borrow<SourceGetter2>>,
+    phantom_data: PhantomData<(K,V,V2)>
+
+}
+
+impl <'source, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clone,
+    Getter: QuerableStreamingMultiMapGetter<K,V>,
+    Getter2: QuerableStreamingMultiMapGetter<K,V2>>
+    QuerableStreamingMultiMapGetter<K,(V, V2)> 
+    for JoinQuerableStreamingMultiMapGetter<K,V, V2, Getter, Getter2> {
         fn get(&self, key: &K)->HashSet<(V, V2)> {
-            let source_values=(*self.source).get(key);
-            let source_values2=(*self.source2).get(key);
+            let source_values=self.source.get(key);
+            let source_values2=self.source2.get(key);
             let mut r=HashSet::new();
             for v in &source_values {
                 for v2 in &source_values2 {
@@ -275,31 +355,51 @@ impl<'a, 'b, 'c, 'd: 'c+'e, 'e, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clon
         }
 }
 
-impl <'a, 'b, 'c, 'd: 'c+'e, 'e, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clone,
-    Source: QuerableStreamingMultiMap<'c, K,V>, Source2: QuerableStreamingMultiMap<'e, K,V2>>
-    MessageListenersInterface<'d, MultiSetModifyMessage<(K,(V, V2))>> 
-    for JoinQuerableStreamingMultiMap<'a, 'b, 'c, 'd, 'e, K,V, V2, Source, Source2> {
-        fn listeners(&self)->&crate::message_listeners::MessageListeners<'d, MultiSetModifyMessage<(K,(V, V2))>> {
+impl<'source, 'listener, 'last_source, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clone,
+    Source: QuerableStreamingMultiMap<'source, 'listener, K,V>,
+    Source2: QuerableStreamingMultiMap<'source, 'listener, K,V2>>
+    QuerableStreamingMultiMap<'source, 'listener, K,(V, V2)> 
+    for JoinQuerableStreamingMultiMap<'source, 'listener, 'last_source, K,V, V2, Source, Source2> {
+        type Getter = JoinQuerableStreamingMultiMapGetter<K,V, V2, Source::Getter, Source2::Getter>;
+        fn getter(&self)->&Self::Getter {
+            &self.getter
+        }
+}
+
+impl <'source, 'listener, 'last_source, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clone,
+    Source: QuerableStreamingMultiMap<'source, 'listener, K,V>,
+    Source2: QuerableStreamingMultiMap<'source, 'listener, K,V2>>
+    MessageListenersInterface<'listener, MultiSetModifyMessage<(K,(V, V2))>> 
+    for JoinQuerableStreamingMultiMap<'source, 'listener, 'last_source, K,V, V2, Source, Source2> {
+        fn listeners(&self)->&MessageListeners<'listener, MultiSetModifyMessage<(K,(V, V2))>> {
             &*self.listeners
         }
 }
 
-impl<'a, 'b, 'c, 'd : 'c+'e, 'e, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clone, 
-    Source: QuerableStreamingMultiMap<'c, K,V>+'e,
-    Source2: QuerableStreamingMultiMap<'e, K,V2>+'c>
-    JoinQuerableStreamingMultiMap<'a, 'b, 'c, 'd, 'e, K,V, V2, Source, Source2> {
-    pub fn new(source: &'a Source, source2: &'b Source2)->Self {
+impl<'source, 'listener, 'last_source, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clone, 
+    Source: QuerableStreamingMultiMap<'source, 'listener, K,V>,
+    Source2: QuerableStreamingMultiMap<'source, 'listener, K,V2>>
+    JoinQuerableStreamingMultiMap<'source, 'listener, 'last_source, K,V, V2, Source, Source2> {
+    pub fn new(source: &'last_source Source, source2: &'last_source Source2)->Self {
+        let source_getter=RcBorrow::new(source.getter());
+        let source2_getter=RcBorrow::new(source2.getter());
         let mut r = Self {
             source: RcBorrow::new(source),
             source2: RcBorrow::new(source2),
             listeners: Rc::new(MultiSetMessageListeners::new()),
-            phantom_data: PhantomData,
-            phantom_data2: PhantomData,
             source_cancel_index: None,
-            source2_cancel_index: None};
+            source2_cancel_index: None,
+            
+            getter: JoinQuerableStreamingMultiMapGetter {
+                source: source_getter.get(),
+                source2: source2_getter.get(),
+                phantom_data: PhantomData
+            },
+            source_getter,
+            source2_getter};
         let rlisteners=r.listeners.clone();
-        let csource=r.source.get();
-        let csource2=r.source2.get();
+        let csource=r.getter.source.clone();
+        let csource2=r.getter.source2.clone();
 
         r.source_cancel_index=Some(source.listeners().listen(move |message| {
             match message {
@@ -335,10 +435,10 @@ impl<'a, 'b, 'c, 'd : 'c+'e, 'e, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clo
     }
 }
 
-impl<'a, 'b, 'c, 'd, 'e, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clone, 
-    Source: QuerableStreamingMultiMap<'c, K,V>,
-    Source2: QuerableStreamingMultiMap<'e, K,V2>>
-    Drop for JoinQuerableStreamingMultiMap<'a, 'b, 'c, 'd, 'e, K,V, V2, Source, Source2> {
+impl<'source, 'listener, 'last_source, K:Eq+Hash+Clone,V:Eq+Hash+Clone, V2:Eq+Hash+Clone, 
+    Source: QuerableStreamingMultiMap<'source, 'listener, K,V>,
+    Source2: QuerableStreamingMultiMap<'source, 'listener, K,V2>>
+    Drop for JoinQuerableStreamingMultiMap<'source, 'listener, 'last_source, K,V, V2, Source, Source2> {
     fn drop(&mut self) {
         if let Some(index)=self.source_cancel_index {
             self.source.get().listeners().cancel(index);
@@ -362,20 +462,14 @@ impl<'a, K:Eq+Hash+Clone+'static,V:Eq+Hash+Clone+'static> MultiSetMessageListene
         r
     }
 
-    pub fn reversed(&'a self)->Rc<StreamingHashMultiMapWithCount<V,K>> {
-        let r=Rc::new(StreamingHashMultiMapWithCount::new());
-        let rclone=r.clone();
-        self.listeners().listen(move |message| {
-                match message {
-                    MultiSetModifyMessage::InsertOne((k,v))=>{rclone.insert(v.clone(),k.clone());},
-                    MultiSetModifyMessage::RemoveOne((k,v))=>{rclone.remove(v.clone(),k.clone());},
-                };
-            });
-        r
+    pub fn reversed<'last_source>(&'last_source self)->
+            Rc<StreamingHashMultiMapWithCount<'a, V,K>> {
+        self.group_by(|k,v| (v,k))
     }
 
-    pub fn group_by<K2: Eq+Hash+Clone+'static, V2: Eq+Hash+Clone+'static>(&'a self, f:impl Fn(K, V)->(K2, V2) + 'a)->
-            Rc<StreamingHashMultiMapWithCount<K2,V2>> {
+    pub fn group_by<'last_source, K2: Eq+Hash+Clone+'static, V2: Eq+Hash+Clone+'static>(
+            &'last_source self, f:impl Fn(K, V)->(K2, V2) + 'a)->
+            Rc<StreamingHashMultiMapWithCount<'a, K2,V2>> {
         let r=Rc::new(StreamingHashMultiMapWithCount::new());
         let rclone=r.clone();
         self.listeners().listen(move |message| {
@@ -422,8 +516,7 @@ fn test_get_one_none() {
 fn test_join() {
     let mut map1 = StreamingHashMultiMapWithCount::new();
     let mut map2 = StreamingHashMultiMapWithCount::new();
-    // let joined_map = map1.join(&map2);
-    let joined_map = JoinQuerableStreamingMultiMap::new(&map1, &map2);
+    let joined_map = map1.join(&map2);
     map1.insert("key", "value");
     map2.insert("key", "value2");
     assert_eq!(joined_map.get_one(&"key"), Some(("value", "value2")));
@@ -455,13 +548,33 @@ fn test_filter_join() {
     let mut map1 = StreamingHashMultiMapWithCount::new();
     let mut map2 = StreamingHashMultiMapWithCount::new();
     let filter_map = map1.filter_item(|k, _| k=="key");
-    // let joined_map = filter_map.join(&map2);
-    let joined_map = JoinQuerableStreamingMultiMap::new(
-            &filter_map, &map2);
+    let joined_map = filter_map.join(&map2);
     map1.insert("key", "value");
     map1.insert("key2", "value3");
     map2.insert("key", "value2");
     map2.insert("key2", "value4");
     assert_eq!(joined_map.get_one(&"key"), Some(("value", "value2")));
     assert_eq!(joined_map.get_one(&"key2"), None);
+}
+
+#[test]
+fn test_group_by() {
+    let mut map1 = StreamingHashMultiMapWithCount::new();
+    let group_map = map1.group_by(|k, v| (v, k));
+    map1.insert("key", "value");
+    map1.insert("key", "value2");
+    map1.insert("key2", "value3");
+    assert_eq!(group_map.get_one(&"value"), Some("key"));
+}
+
+#[test]
+fn test_reversed() {
+    let mut map1 = StreamingHashMultiMapWithCount::new();
+    map1.insert("key", "value");
+    map1.insert("key", "value2");
+    map1.insert("key2", "value3");
+    // let group_map = map1.reversed();
+    let l=map1.listeners();
+    // let group_map = l.reversed();
+    // assert_eq!(group_map.get_one(&"value"), Some("key"));
 }
